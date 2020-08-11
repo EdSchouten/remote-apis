@@ -185,8 +185,8 @@ service ActionCache {
 // [Action][build.bazel.remote.execution.v2.Action],
 // however, the client will need to also upload the
 // [Command][build.bazel.remote.execution.v2.Command] and input root
-// [Directory][build.bazel.remote.execution.v2.Directory] for the Action.
-// The Command and Directory messages must be marshalled to wire format and then
+// [SingleDirectory][build.bazel.remote.execution.v2.SingleDirectory] for the Action.
+// The Command and SingleDirectory messages must be marshalled to wire format and then
 // uploaded under the hash as with any other piece of content. In practice, the
 // input root directory is likely to refer to other Directories in its
 // hierarchy, which must also each be uploaded on their own.
@@ -317,9 +317,9 @@ service ContentAddressableStorage {
   // Fetch the entire directory tree rooted at a node.
   //
   // This request must be targeted at a
-  // [Directory][build.bazel.remote.execution.v2.Directory] stored in the
+  // [SingleDirectory][build.bazel.remote.execution.v2.SingleDirectory] stored in the
   // [ContentAddressableStorage][build.bazel.remote.execution.v2.ContentAddressableStorage]
-  // (CAS). The server will enumerate the `Directory` tree recursively and
+  // (CAS). The server will enumerate the `SingleDirectory` tree recursively and
   // return every node descended from the root.
   //
   // The GetTreeRequest.page_token parameter can be used to skip ahead in
@@ -392,7 +392,7 @@ message Action {
   Digest command_digest = 1;
 
   // The digest of the root
-  // [Directory][build.bazel.remote.execution.v2.Directory] for the input
+  // [SingleDirectory][build.bazel.remote.execution.v2.SingleDirectory] for the input
   // files. The files in the directory tree are available in the correct
   // location on the build machine before the command is executed. The root
   // directory, as well as every subdirectory and content blob referred to, MUST
@@ -618,24 +618,25 @@ message Platform {
   repeated Property properties = 1;
 }
 
-// A `Directory` represents a directory node in a file tree, containing zero or
+// A `DirectoryContents` represents a directory node in a file tree, containing zero or
 // more children [FileNodes][build.bazel.remote.execution.v2.FileNode],
 // [DirectoryNodes][build.bazel.remote.execution.v2.DirectoryNode] and
 // [SymlinkNodes][build.bazel.remote.execution.v2.SymlinkNode].
-// Each `Node` contains its name in the directory, either the digest of its
-// content (either a file blob or a `Directory` proto) or a symlink target, as
+// Each `Node` contains its name in the directory, either the digest of
+// the file blob, the index of the directory in the containing
+// `SingleDirectory` or `Tree`, or a symlink target, as
 // well as possibly some metadata about the file or directory.
 //
 // In order to ensure that two equivalent directory trees hash to the same
 // value, the following restrictions MUST be obeyed when constructing a
-// a `Directory`:
+// a `DirectoryContents`:
 //
 // * Every child in the directory must have a path of exactly one segment.
 //   Multiple levels of directory hierarchy may not be collapsed.
 // * Each child in the directory must have a unique path segment (file name).
 //   Note that while the API itself is case-sensitive, the environment where
 //   the Action is executed may or may not be case-sensitive. That is, it is
-//   legal to call the API with a Directory that has both "Foo" and "foo" as
+//   legal to call the API with a DirectoryContents that has both "Foo" and "foo" as
 //   children, but the Action may be rejected by the remote system upon
 //   execution.
 // * The files, directories and symlinks in the directory must each be sorted
@@ -645,14 +646,14 @@ message Platform {
 //   directories, and symlinks must be sorted in lexicographical order by
 //   property name.
 //
-// A `Directory` that obeys the restrictions is said to be in canonical form.
+// A `DirectoryContents` that obeys the restrictions is said to be in canonical form.
 //
 // As an example, the following could be used for a file named `bar` and a
 // directory named `foo` with an executable file named `baz` (hashes shortened
 // for readability):
 //
 // ```json
-// // (Directory proto)
+// // (DirectoryContents proto)
 // {
 //   files: [
 //     {
@@ -680,7 +681,7 @@ message Platform {
 //   ]
 // }
 //
-// // (Directory proto with hash "4cf2eda940..." and size 43)
+// // (DirectoryContents proto with hash "4cf2eda940..." and size 43)
 // {
 //   files: [
 //     {
@@ -694,7 +695,7 @@ message Platform {
 //   ]
 // }
 // ```
-message Directory {
+message DirectoryContents {
   // The files in the directory.
   repeated FileNode files = 1;
 
@@ -704,7 +705,7 @@ message Directory {
   // The symlinks in the directory.
   repeated SymlinkNode symlinks = 3;
 
-  // The node properties of the Directory.
+  // The node properties of the directory.
   reserved 4;
   NodeProperties node_properties = 5;
 }
@@ -758,17 +759,17 @@ message FileNode {
 }
 
 // A `DirectoryNode` represents a child of a
-// [Directory][build.bazel.remote.execution.v2.Directory] which is itself
-// a `Directory` and its associated metadata.
+// [DirectoryContents][build.bazel.remote.execution.v2.DirectoryContents] which is itself
+// a `DirectoryContents` and its associated metadata.
 message DirectoryNode {
   // The name of the directory.
   string name = 1;
 
-  // The digest of the
-  // [Directory][build.bazel.remote.execution.v2.Directory] object
-  // represented. See [Digest][build.bazel.remote.execution.v2.Digest]
-  // for information about how to take the digest of a proto message.
-  Digest digest = 2;
+  // The index within Tree.children or SingleDirectory.children of the
+  // object represented. Because Tree.children is required to be
+  // topologically sorted, child_index must be larger than the index of
+  // the current directory when contained in Tree.children.
+  uint32 child_index = 2;
 }
 
 // A `SymlinkNode` represents a symbolic link.
@@ -969,7 +970,7 @@ message ActionResult {
   //     ]
   //   }
   //   children : {
-  //     // (Directory proto with hash "4cf2eda940..." and size 43)
+  //     // (DirectoryContents proto with hash "4cf2eda940..." and size 43)
   //     files: [
   //       {
   //         name: "baz",
@@ -1069,18 +1070,24 @@ message OutputFile {
   NodeProperties node_properties = 7;
 }
 
+message SingleDirectory {
+  DirectoryContents root = 1;
+
+  repeated Digest children = 2;
+}
+
 // A `Tree` contains all the
-// [Directory][build.bazel.remote.execution.v2.Directory] protos in a
+// [DirectoryContents][build.bazel.remote.execution.v2.DirectoryContents] protos in a
 // single directory Merkle tree, compressed into one message.
 message Tree {
   // The root directory in the tree.
-  Directory root = 1;
+  DirectoryContents root = 1;
 
   // All the child directories: the directories referred to by the root and,
-  // recursively, all its children. In order to reconstruct the directory tree,
-  // the client must take the digests of each of the child directories and then
-  // build up a tree starting from the `root`.
-  repeated Directory children = 2;
+  // recursively, all its children. Entries in this list must be
+  // topologically sorted, where parent directories are stored before
+  // child directories.
+  repeated DirectoryContents children = 2;
 }
 
 // An `OutputDirectory` is the output in an `ActionResult` corresponding to a
@@ -1452,7 +1459,7 @@ message GetTreeRequest {
   string instance_name = 1;
 
   // The digest of the root, which must be an encoded
-  // [Directory][build.bazel.remote.execution.v2.Directory] message
+  // [SingleDirectory][build.bazel.remote.execution.v2.SingleDirectory] message
   // stored in the
   // [ContentAddressableStorage][build.bazel.remote.execution.v2.ContentAddressableStorage].
   Digest root_digest = 2;
@@ -1474,7 +1481,7 @@ message GetTreeRequest {
 // [ContentAddressableStorage.GetTree][build.bazel.remote.execution.v2.ContentAddressableStorage.GetTree].
 message GetTreeResponse {
   // The directories descended from the requested root.
-  repeated Directory directories = 1;
+  repeated SingleDirectory directories = 1;
 
   // If present, signifies that there are more results which the client can
   // retrieve by passing this as the page_token in a subsequent
