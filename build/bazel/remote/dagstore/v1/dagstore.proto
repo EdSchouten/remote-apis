@@ -1,0 +1,366 @@
+// Copyright 2024 The Bazel Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package build.bazel.remote.dagstore.v1;
+
+import "google/protobuf/any.proto";
+import "google/rpc/status.proto";
+
+// DAGStore is a data store that is capable of storing binary objects
+// that are between 1 byte and 2 MiB in size. The 2 MiB limit is chosen
+// specifically because gRPC has a default maximum message size limit of
+// 4 MiB. This means that any object can be transmitted via gRPC using a
+// single message.
+//
+// To store data sets that are larger than 2 MiB in size (e.g., large
+// files or directory hierarchies), objects may contain outgoing
+// references to other objects. Due to references containing
+// cryptographic hashes, they cannot be cyclic. Objects therefore
+// collectively form a forest of Directed Acyclic Graphs (DAGs). In
+// order to make DAGStore aware of these references while remaining
+// oblivious of an object's actual data format, outgoing references are
+// stored at the beginning of the object, as shown in the diagram below:
+//
+// <---------------------------- object -------------------------------->
+// +-------------+-------------+-----+---------------+------------------+
+// | reference 0 | reference 1 | ... | reference n-1 | freeform payload |
+// +-------------+-------------+-----+---------------+------------------+
+//
+// Outgoing references are stored consecutively without any framing or
+// padding, and MUST use the same format as the reference of the object
+// itself. For a given object, outgoing references MUST be unique and
+// sorted by their binary representation. This is done to ensure that
+// the graph structure of objects reveals less information about the
+// data being stored, which is important if payloads are encrypted.
+service DAGStore {
+  // Download the contents of a single object from storage by providing
+  // a reference.
+  rpc DownloadObject(DownloadObjectRequest) returns (DownloadObjectResponse);
+
+  // Resolve the reference of an object that's associated with a given
+  // tag. Optionally, return the contents of the object.
+  rpc ResolveTag(ResolveTagRequest) returns (ResolveTagResponse);
+
+  // Upload DAGs of objects to the server, only transferring objects
+  // that are not present remotely.
+  //
+  // It is common for clients to upload multiple DAGs to the server that
+  // have large amounts of overlap. For example, a build client could
+  // upload many input roots of compilation actions that use the same
+  // toolchain. Because of that, it is recommended that all uploads
+  // performed by a single client are part of the same gRPC call. This
+  // permits the server to collapse uploads of identical parts of DAGs.
+  //
+  // The UploadDAGsRequest and UploadDAGsResponse messages contain
+  // nested request/response messages. The sequence in which clients and
+  // servers issue these is as follows:
+  //
+  // - The client sends an UploadDAGsRequest.Handshake to the client.
+  // - In response, the server sends an UploadDAGsResponse.Handshake
+  //   back to the client.
+  //
+  // From that point on, the client may in parallel initiate multiple
+  // instances of the following flows:
+  //
+  // - The client sends an UploadDAGsRequest.InitiateDAG to inform the
+  //   server that it wants to upload a DAG with a given root object.
+  // - The server sends an UploadDAGsResponse.RequestObject to indicate
+  //   whether or not it wants to receive the DAG's root object.
+  //   - If so, the client sends the contents of the object via
+  //     UploadDAGsRequest.ProvideObjectContents.
+  //   - For each of the outgoing references of the root object, the
+  //     server sends UploadDAGsResponse.RequestObject to indicate
+  //     whether or not it wants to receive the child objects.
+  //   - ...
+  // - Once the objects within a DAG for which the server can issue
+  //   UploadDAGsResponse.RequestObject have exhausted, the server sends
+  //   UploadDAGsResponse.FinalizeDAG to report whether the DAG has been
+  //   persisted successfully.
+  //
+  // In order to correlated messages UploadDAGsRequest.ProvideObjectContents,
+  // UploadDAGsResponse.RequestObject, and UploadDAGsResponse.FinalizeDAG
+  // against previously transmitted messages, UploadDAGs() uses the
+  // concept of reference indices. These indices are sequentially
+  // assigned to references in the order in which they occur in
+  // UploadDAGsRequest.InitiateDAG and UploadDAGsRequest.ProvideObjectContents
+  // messages. The reference that is part of the very first
+  // UploadDAGsRequest.InitiateDAG message will always have reference
+  // index zero.
+  rpc UploadDAGs(stream UploadDAGsRequest) returns (stream UploadDAGsResponse);
+}
+
+message ReferenceFormat {
+  enum Value {
+    // Invalid value.
+    UNKNOWN = 0;
+
+    // References that are 40 bytes (320 bits) in size, containing fields
+    // stored in the order listed below:
+    //
+    // - hash: SHA-256 hash of the object, stored as 32 bytes of binary
+    //   data.
+    //
+    // - size_bytes: Size of the object in bytes, stored as a 24-bit
+    //   little endian integer.
+    //
+    // - height: Height of the object, stored as an 8-bit integer. The
+    //   height is zero iff the degree is zero as well.
+    //
+    // - degree: Degree of the object (i.e., the number of outgoing
+    //   references), stored as a 16-bit little endian integer.
+    //
+    // - maximum_parents_size_bytes_total: Maximum total size of all
+    //   parent objects in any path in the tree rooted at the object,
+    //   excluding the root object itself. The total size is stored as a
+    //   16-bit little endian floating point value, having the following
+    //   two fields:
+    //
+    //   - An exponent that is stored in the top 5 bits.
+    //   - A significand that is stored in the bottom 11 bits.
+    //
+    //   When the exponent is zero, the value is a subnormal number.
+    //   When the exponent is non-zero, the value is a normal number.
+    //   Unlike IEEE 754 floating point numbers, no exponent is reserved
+    //   to indicate infinity, nor is there a sign bit present.
+    //
+    //   The exponent bias is chosen such that the smallest subnormal
+    //   number is equal to integer value 1. The smallest normal number
+    //   is thus equal to integer value 2048, while the largest normal
+    //   number is equal to 0xfff << 30 == 4396972769280.
+    //
+    //   This value MUST be computed by adding the size_bytes and
+    //   maximum_path_total_size_bytes fields of each outgoing reference
+    //   to a parent object without any loss of precision, selecting the
+    //   largest value, and converting the result back to a floating
+    //   point value rounding upwards.
+    SHA256_V1 = 1;
+  }
+}
+
+message DownloadObjectRequest {
+  // The instance of the execution system to operate against. A server
+  // may support multiple instances of the execution system (with their
+  // own workers, storage, caches, etc.). The server MAY require use of
+  // this field to select between them in an implementation- defined
+  // fashion, otherwise it can be omitted.
+  string instance_name = 1;
+
+  // The format of DownloadObjectRequest.reference.
+  ReferenceFormat.Value reference_format = 2;
+
+  // Reference of the object to download.
+  bytes reference = 3;
+}
+
+message DownloadObjectResponse {
+  // The contents of the object that was requested.
+  bytes contents = 2;
+}
+
+message ResolveTagRequest {
+  // The instance of the execution system to operate against. A server
+  // may support multiple instances of the execution system (with their
+  // own workers, storage, caches, etc.). The server MAY require use of
+  // this field to select between them in an implementation- defined
+  // fashion, otherwise it can be omitted.
+  string instance_name = 1;
+
+  // The tag that should be resolved.
+  google.protobuf.Any tag = 2;
+
+  // If set to true, return that the contents of the object itself are
+  // also returned by the server. This prevents the need for calling
+  // DownloadObject() manually, thereby saving a round trip.
+  bool request_contents = 3;
+}
+
+message ResolveTagResponse {
+  // The format of the reference that was associated with the tag.
+  ReferenceFormat.Value reference_format = 1;
+
+  // The reference that was associated with the tag.
+  bytes reference = 2;
+
+  // The contents of the object, if ResolveTagRequest.request_contents
+  // was set to true.
+  bytes contents = 3;
+}
+
+message UploadDAGsRequest {
+  message Handshake {
+    // The instance of the execution system to operate against. A server
+    // may support multiple instances of the execution system (with
+    // their own workers, storage, caches, etc.). The server MAY require
+    // use of this field to select between them in an implementation-
+    // defined fashion, otherwise it can be omitted.
+    string instance_name = 1;
+
+    // The format of UploadDAGsRequest.InitiateDAG.root_reference and
+    // any references contained in
+    // UploadDAGsRequest.ProvidedObjectContents.contents.
+    ReferenceFormat.Value reference_format = 2;
+
+    // The maximum permitted number of parent objects for which the
+    // server has one or more child objects for which it still needs to
+    // issue RequestObject.
+    //
+    // This option can be used by clients to limit the breadth at which
+    // DAGs to be uploaded are traversed by the server. Increasing
+    // breadth increases parallelism, but does lead to higher resource
+    // utilization. If all parent objects of the DAGs already reside in
+    // the client's memory, the client can typically set this to 2^32-1.
+    // If the DAGs to be uploaded need to be loaded from external
+    // storage, the client SHOULD set this to a value that prevents the
+    // server from exhausting memory on the client.
+    //
+    // The server MUST ensure that this limit is not exceeded by letting
+    // the traversal order respect the references' 'height' field.
+    // Conversely, the client SHOULD validate that the traversal order
+    // used by the server respects this invariant.
+    uint32 maximum_unrequested_parents_count = 3;
+
+    // The maximum total size of parent objects for which the server has
+    // one or more child objects for which it still needs to issue
+    // RequestObject.
+    //
+    // Similar to the above, the client can typically set this to 2^64-1
+    // if all parent objects of the DAGs to be uploaded already reside
+    // in the client's memory. Otherwise the client SHOULD set this to a
+    // value that prevents the server from exhausting memory on the
+    // client.
+    //
+    // The server MUST ensure that this limit is not exceeded by letting
+    // the traversal order respect the references' 'size_bytes' and
+    // 'maximum_parents_size_bytes_total' fields. Conversely, the client
+    // SHOULD validate that the traversal order used by the server
+    // respects this invariant.
+    uint64 maximum_unrequested_parents_size_bytes_total = 4;
+  }
+
+  message InitiateDAG {
+    // Reference of the root of the DAG to upload. This reference is
+    // assigned to the next available reference index. If this is the
+    // first InitiateDAG message observed as part of this call to
+    // UploadDAGs(), reference index zero is used.
+    bytes root_reference = 1;
+
+    // Assign a tag to the root of the DAG, so that it can subsequently
+    // be resolved using DAGStore.ResolveTag(). This can for example be
+    // used to cache the results of a build action, allowing other
+    // clients to look them up by action.
+    google.protobuf.Any root_tag = 2;
+  }
+
+  message ProvideObjectContents {
+    // The index of the reference for which the object's contents are
+    // provided.
+    uint64 lowest_reference_index = 1;
+
+    // The contents of the object that was requested.
+    //
+    // When the provides contents contain one or more outgoing
+    // references, they are assigned to consecutively numbered reference
+    // indices [n, n+m), where n corresponds to the next available
+    // reference index and m to the number of outgoing references of the
+    // object.
+    //
+    // The client MAY leave this field empty if it wants to cancel
+    // uploading DAGs containing the object. In that case no new
+    // reference indices are assigned. The server SHOULD respond with
+    // UploadDAGsResponse.RequestObject messages for each of the
+    // remaining unrequested objects in the DAGs with
+    // UploadDAGsResponse.RequestObject.request_contents set to false.
+    // Subsequently, the server SHOULD respond with FinalizeDAG messages
+    // for each of the DAGs with UploadDAGsResponse.FinalizeDAG.status.code
+    // set to CANCELLED.
+    bytes contents = 2;
+  }
+
+  oneof type {
+    // The first message to be sent by the client.
+    Handshake handshake = 1;
+
+    // Start the transmission of a new DAG.
+    InitiateDAG initiate_dag = 2;
+
+    // Provide the contents of an object to the server. This message is
+    // sent in response to the server sending a RequestObject message
+    // where UploadDAGsResponse.RequestObject.request_contents is true.
+    ProvideObjectContents provide_object_contents = 3;
+  }
+}
+
+message UploadDAGsResponse {
+  message Handshake {
+    // The maximum number of times the client is permitted to send
+    // UploadDAGsRequest.InitiateDAG requests without receiving
+    // corresponding UploadDAGsResponse.FinalizeDAG responses from the
+    // server to indicate that uploading of a DAG has completed.
+    uint32 maximum_unfinalized_dags_count = 1;
+  }
+
+  message RequestObject {
+    // The reference index of the object to request.
+    //
+    // Because of overlap between parts of DAGs, multiple reference
+    // indices may refer to the same object. In that case, this field
+    // MUST be set to the lowest index that is known to the server which
+    // has not yet been requested.
+    uint64 lowest_reference_index = 1;
+
+    // The number of additional reference indices that the server knows
+    // refer to the same object. This can be used by the server to
+    // collapse uploads of identical parts of DAGs. For these parts the
+    // server no longer needs to send additional
+    // UploadDAGsResponse.RequestObject messages.
+    uint32 additional_reference_indices = 2;
+
+    // Whether the server wants the client to upload the object's
+    // contents. This can be set to false if the server is already in
+    // possession of the object and all of transitive children. When set
+    // to true, the client MUST respond by sending a
+    // UploadDAGsRequest.ProvideObjectContents message with
+    // UploadDAGsRequest.ProvideObjectContents.lowest_reference_index
+    // set to the same value as
+    // UploadDAGsResponse.RequestObject.lowest_reference_index.
+    bool request_contents = 3;
+  }
+
+  message FinalizeDAG {
+    // Index of the reference of the root of the DAG to finalize.
+    uint64 root_reference_index = 1;
+
+    // Status that indicates whether writing all objects contained in
+    // the DAG and creating the provided tag succeeded.
+    google.rpc.Status status = 2;
+  }
+
+  oneof type {
+    // The first message to be sent by the server in response to the
+    // handshake message sent by the client.
+    Handshake handshake = 1;
+
+    // Instruct the client to either upload an object, or to discard it
+    // due to it already being present on the server.
+    RequestObject request_object = 2;
+
+    // Inform the client that it will no longer send any
+    // UploadDAGsResponse.RequestObject messages pertaining to a given
+    // DAG, and report whether writing the provided DAG and tag
+    // succeeded.
+    FinalizeDAG finalize_dag = 3;
+  }
+}
