@@ -246,10 +246,10 @@ message UploadDAGsRequest {
     // UploadDAGs(), reference index zero is used.
     bytes root_reference = 1;
 
-    // Assign a tag to the root of the DAG, so that it can subsequently
-    // be resolved using DAGStore.ResolveTag(). This can for example be
-    // used to cache the results of a build action, allowing other
-    // clients to look them up by action.
+    // If set, assign a tag to the root of the DAG, so that it can
+    // subsequently be resolved using DAGStore.ResolveTag(). This can
+    // for example be used to cache the results of a build action,
+    // allowing other clients to look them up by action.
     google.protobuf.Any root_tag = 2;
   }
 
