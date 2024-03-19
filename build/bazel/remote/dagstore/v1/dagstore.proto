@@ -150,7 +150,7 @@ message ReferenceFormat {
   }
 }
 
-message DownloadObjectRequest {
+message Namespace {
   // The instance of the execution system to operate against. A server
   // may support multiple instances of the execution system (with their
   // own workers, storage, caches, etc.). The server MAY require use of
@@ -158,25 +158,26 @@ message DownloadObjectRequest {
   // fashion, otherwise it can be omitted.
   string instance_name = 1;
 
-  // The format of DownloadObjectRequest.reference.
+  // The format that is used to encode references.
   ReferenceFormat.Value reference_format = 2;
+}
+
+message DownloadObjectRequest {
+  // The namespace from which to download the object.
+  Namespace namespace = 1;
 
   // Reference of the object to download.
-  bytes reference = 3;
+  bytes reference = 2;
 }
 
 message DownloadObjectResponse {
   // The contents of the object that was requested.
-  bytes contents = 2;
+  bytes contents = 1;
 }
 
 message ResolveTagRequest {
-  // The instance of the execution system to operate against. A server
-  // may support multiple instances of the execution system (with their
-  // own workers, storage, caches, etc.). The server MAY require use of
-  // this field to select between them in an implementation- defined
-  // fashion, otherwise it can be omitted.
-  string instance_name = 1;
+  // The namespace in which the tag resides.
+  Namespace namespace = 1;
 
   // The tag that should be resolved.
   google.protobuf.Any tag = 2;
@@ -188,30 +189,18 @@ message ResolveTagRequest {
 }
 
 message ResolveTagResponse {
-  // The format of the reference that was associated with the tag.
-  ReferenceFormat.Value reference_format = 1;
-
   // The reference that was associated with the tag.
-  bytes reference = 2;
+  bytes reference = 1;
 
   // The contents of the object, if ResolveTagRequest.request_contents
   // was set to true.
-  bytes contents = 3;
+  bytes contents = 2;
 }
 
 message UploadDAGsRequest {
   message Handshake {
-    // The instance of the execution system to operate against. A server
-    // may support multiple instances of the execution system (with
-    // their own workers, storage, caches, etc.). The server MAY require
-    // use of this field to select between them in an implementation-
-    // defined fashion, otherwise it can be omitted.
-    string instance_name = 1;
-
-    // The format of UploadDAGsRequest.InitiateDAG.root_reference and
-    // any references contained in
-    // UploadDAGsRequest.ProvidedObjectContents.contents.
-    ReferenceFormat.Value reference_format = 2;
+    // The namespace where to store DAGs.
+    Namespace namespace = 1;
 
     // The maximum permitted number of parent objects for which the
     // server has one or more child objects for which it still needs to
